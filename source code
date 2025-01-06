@@ -1,0 +1,246 @@
+import os
+import smtplib
+import imaplib
+import email
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.mime.base import MIMEBase
+from email import encoders
+from PyPDF2 import PdfReader
+import openpyxl
+from openpyxl.styles import Alignment, Font
+from fpdf import FPDF
+from pymongo import MongoClient
+
+# Configuration
+MONGO_URI = 'mongodb://localhost:27017'
+DATABASE_NAME = 'budget_automation'
+COLLECTION_NAME = 'email_logs'
+IMAP_SERVER = 'imap.gmail.com'
+SMTP_SERVER = 'smtp.gmail.com'
+PROJECT_EMAIL = 'textile1444@gmail.com'
+PROJECT_PASSWORD = 'password'  # Replace with mailid password
+
+# MongoDB Connection
+def connect_to_mongodb():
+    client = MongoClient(MONGO_URI)
+    return client[DATABASE_NAME][COLLECTION_NAME]
+
+# Save to MongoDB
+def save_to_mongodb(collection, data):
+    collection.insert_one(data)
+    print("Data saved to MongoDB:", data)
+
+# Read unread emails and download PDF attachments
+def read_unread_email_with_pdf():
+    try:
+        mail = imaplib.IMAP4_SSL(IMAP_SERVER)
+        mail.login(PROJECT_EMAIL, PROJECT_PASSWORD)
+        mail.select('inbox')
+
+        # Search for unread emails
+        status, search_data = mail.search(None, 'UNSEEN')
+        
+        # Loop through each unread email
+        for email_id in search_data[0].split():
+            status, data = mail.fetch(email_id, '(RFC822)')
+            raw_email = data[0][1]
+            email_message = email.message_from_bytes(raw_email)
+
+            sender = email_message['from']
+            subject = email_message['subject']
+
+            for part in email_message.walk():
+                if part.get_content_type() == 'application/pdf':
+                    filename = part.get_filename()
+                    if filename:
+                        with open(filename, 'wb') as pdf_file:
+                            pdf_file.write(part.get_payload(decode=True))
+                        mail.store(email_id, '+FLAGS', '\\Seen')
+
+                        return filename, {'sender': sender, 'subject': subject, 'attachment': filename}
+
+        return None, None
+
+    except Exception as e:
+        print(f"An error occurred while reading emails: {e}")
+        return None, None
+
+# Extract text from PDF
+def extract_text_from_pdf(pdf_file):
+    try:
+        reader = PdfReader(pdf_file)
+        return "\n".join(page.extract_text() for page in reader.pages)
+    except Exception as e:
+        print(f"Error reading PDF: {e}")
+        return ""
+
+# Create Excel file with the required format
+def create_excel_file(output_file, costing_data=None):
+    try:
+        workbook = openpyxl.Workbook()
+        sheet = workbook.active
+        sheet.title = "Sheet1"
+
+        # Define headers
+        headers1_main = ["Dim", "Description", "Comment", "Tol (-)", "Tol (+)", "XS", "", "", "S", "", "", "M", "", "", "L", "", "", "XL", "", ""]
+        sheet.append(headers1_main)
+
+        # Merge cells for size headers
+        size_headers = ["XS", "S", "M", "L", "XL"]
+        start_col = 6  # Starting from column F
+        for size in size_headers:
+            sheet.merge_cells(start_row=1, start_column=start_col, end_row=1, end_column=start_col + 2)
+            cell = sheet.cell(row=1, column=start_col, value=size)
+            cell.alignment = Alignment(horizontal='center', vertical='center')
+            cell.font = Font(bold=True)
+            start_col += 3
+
+        # Add subheaders
+        subheaders = ["", "", "", "", ""]
+        for _ in size_headers:
+            subheaders.extend(["Increment", "Sample", "Deviation"])
+        sheet.append(subheaders)
+
+        # Apply alignment to subheaders
+        for col in range(6, 6 + 3 * len(size_headers)):
+            cell = sheet.cell(row=2, column=col)
+            cell.alignment = Alignment(horizontal='center', vertical='center')
+
+        # Add data rows
+        if costing_data and 'sheet1_data' in costing_data:
+            for row in costing_data['sheet1_data']:
+                fixed_columns = row[:5]  # Fixed columns: Dim, Description, Comment, Tol (-), Tol (+)
+                data_columns = row[5:]  # Remaining columns for sizes
+                formatted_row = fixed_columns
+                for i in range(0, len(data_columns), 3):  # Group size-specific columns in sets of 3
+                    formatted_row.extend(data_columns[i:i+3])
+                sheet.append(formatted_row)
+
+        # Sheet2: Costing Data
+        sheet2 = workbook.create_sheet("Sheet2")
+        headers2 = ["Placement", "Quantity", "Per Rate", "Composition"]
+        sheet2.append(headers2)
+
+        if costing_data and 'sheet2_data' in costing_data:
+            for row in costing_data['sheet2_data']:
+                sheet2.append(row)
+
+        # Format Sheet2 headers
+        for col in range(1, len(headers2) + 1):
+            cell = sheet2.cell(row=1, column=col)
+            cell.font = Font(bold=True)
+            cell.alignment = Alignment(horizontal='center', vertical='center')
+
+        workbook.save(output_file)
+        print(f"Excel file created successfully: {output_file}")
+
+    except Exception as e:
+        print(f"Error creating Excel file: {e}")
+
+# Create Costing Sheet PDF
+def create_costing_pdf(output_file, costing_data):
+    try:
+        pdf = FPDF()
+        pdf.add_page()
+        pdf.set_font("Arial", size=12)
+        pdf.cell(200, 10, txt="Costing Sheet", ln=True, align='C')
+        pdf.ln(10)
+
+        # Set table headers
+        pdf.set_font("Arial", 'B', size=10)
+        pdf.cell(40, 10, 'Placement', border=1, align='C')
+        pdf.cell(40, 10, 'Composition', border=1, align='C')
+        pdf.cell(40, 10, 'Quantity', border=1, align='C')
+        pdf.cell(40, 10, 'Per Rate', border=1, align='C')
+        pdf.cell(40, 10, 'Total', border=1, align='C')
+        pdf.ln()
+
+        # Add data rows
+        pdf.set_font("Arial", size=10)
+        grand_total = 0
+        for item in costing_data['sheet2_data']:
+            total = item[1] * item[2]  # Quantity * Per Rate
+            pdf.cell(40, 10, item[0], border=1, align='C')  # Placement
+            pdf.cell(40, 10, item[3], border=1, align='C')  # Composition
+            pdf.cell(40, 10, str(item[1]), border=1, align='C')  # Quantity
+            pdf.cell(40, 10, str(item[2]), border=1, align='C')  # Per Rate
+            pdf.cell(40, 10, str(total), border=1, align='C')  # Total
+            pdf.ln()
+            grand_total += total
+
+        # Add Grand Total row
+        pdf.set_font("Arial", 'B', size=12)
+        pdf.cell(160, 10, 'Grand Total', border=1, align='C')
+        pdf.cell(40, 10, str(grand_total), border=1, align='C')
+        pdf.ln()
+
+        pdf.output(output_file)
+        print(f"Costing Sheet PDF created: {output_file}")
+    except Exception as e:
+        print(f"Error creating PDF file: {e}")
+
+# Send email with attachments
+def send_email_with_attachments(sender_email, subject, body, attachments):
+    try:
+        msg = MIMEMultipart()
+        msg['From'] = PROJECT_EMAIL
+        msg['To'] = sender_email
+        msg['Subject'] = subject
+
+        msg.attach(MIMEText(body, 'plain'))
+
+        for file_path in attachments:
+            if os.path.exists(file_path):
+                with open(file_path, 'rb') as attachment:
+                    part = MIMEBase('application', 'octet-stream')
+                    part.set_payload(attachment.read())
+                    encoders.encode_base64(part)
+                    part.add_header('Content-Disposition', f'attachment; filename={os.path.basename(file_path)}')
+                    msg.attach(part)
+
+        with smtplib.SMTP(SMTP_SERVER, 587) as server:
+            server.starttls()
+            server.login(PROJECT_EMAIL, PROJECT_PASSWORD)
+            server.send_message(msg)
+
+        print(f"Email sent to {sender_email} with attachments: {attachments}")
+    except Exception as e:
+        print(f"Error sending email: {e}")
+
+# Main Execution
+if __name__ == '__main__':
+    collection = connect_to_mongodb()
+
+    pdf_file, email_data = read_unread_email_with_pdf()
+    if pdf_file and email_data:
+        extracted_text = extract_text_from_pdf(pdf_file)
+
+        email_data['status'] = 'Processed'
+        save_to_mongodb(collection, email_data)
+
+        costing_data = {
+            'sheet1_data': [
+                ["1X1", "Bottom Hem Width", "", -1.00, 1.00, 46.00, 50.00, 54.00, 58.00, 64.00],
+                ["1F3", "Across Shoulder", "", -1.00, 1.00, 36.00, 38.00, 40.00, 42.00, 44.00],
+                ["1F6", "Shoulder Angle", "", -0.50, 0.50, 2.50, 2.50, 2.50, 2.50, 2.50],
+            ],
+            'sheet2_data': [
+                ("Main Fabric", 3, 0.25, "Combed Cotton"),
+                ("Rib", 2, 0.75, "100% Rib"),
+            ]
+        }
+
+        create_excel_file('output.xlsx', costing_data)
+        create_costing_pdf('costing_sheet.pdf', costing_data)
+
+        send_email_with_attachments(
+            sender_email=email_data['sender'],
+            subject='Processed Budget Files',
+            body='Please find the processed budget files attached.',
+            attachments=['output.xlsx', 'costing_sheet.pdf']
+        )
+
+        print("Process completed successfully.")
+    else:
+        print("No unread email with PDF attachment found.")
